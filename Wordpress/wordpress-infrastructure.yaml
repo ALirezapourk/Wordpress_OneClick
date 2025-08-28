@@ -1,0 +1,805 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Complete WordPress Infrastructure with Auto Scaling, Load Balancer, RDS MariaDB, and EFS - Production Ready'
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of existing EC2 KeyPair for SSH access
+    
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t2.micro, t2.small, t2.medium]
+    Description: EC2 instance type
+    
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: Database password (minimum 8 characters)
+    
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+    Description: RDS instance type
+    
+  EnableMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false'] 
+    Description: Enable Multi-AZ for RDS (recommended for production)
+    
+  EnableHighAvailabilityNAT:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Deploy NAT Gateway in both AZs (recommended for production)
+
+Conditions:
+  EnableHANAT: !Equals [!Ref EnableHighAvailabilityNAT, 'true']
+  EnableMultiAZDB: !Equals [!Ref EnableMultiAZ, 'true']
+
+Resources:
+  # VPC Configuration
+  WordPressVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: WordPress-VPC
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: WordPress-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref WordPressVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets (for Load Balancer)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public-Subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public-Subnet-2
+
+  # Private Subnets (for EC2 instances)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Private-Subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WordPressVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Private-Subnet-2
+
+  # NAT Gateway for private subnet internet access - AZ1
+  NATGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NAT-Gateway-1-EIP
+
+  NATGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: NAT-Gateway-1
+
+  # NAT Gateway for private subnet internet access - AZ2 (High Availability)
+  NATGateway2EIP:
+    Type: AWS::EC2::EIP
+    Condition: EnableHANAT
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NAT-Gateway-2-EIP
+
+  NATGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: EnableHANAT
+    Properties:
+      AllocationId: !GetAtt NATGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: NAT-Gateway-2
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+      Tags:
+        - Key: Name
+          Value: Public-Route-Table
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Private Route Table for AZ1
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+      Tags:
+        - Key: Name
+          Value: Private-Route-Table-1
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  # Private Route Table for AZ2
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WordPressVPC
+      Tags:
+        - Key: Name
+          Value: Private-Route-Table-2
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [EnableHANAT, !Ref NATGateway2, !Ref NATGateway1]
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-Security-Group
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for WordPress EC2 instances
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: WebServer-Security-Group
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MariaDB database
+      VpcId: !Ref WordPressVPC
+      Tags:
+        - Key: Name
+          Value: Database-Security-Group
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS
+      VpcId: !Ref WordPressVPC
+      Tags:
+        - Key: Name
+          Value: EFS-Security-Group
+
+  ProvisioningSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for WordPress provisioning server
+      VpcId: !Ref WordPressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: Provisioning-Security-Group
+
+  # Security Group Rules (created after security groups to avoid circular dependencies)
+  DatabaseSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  DatabaseSecurityGroupIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref ProvisioningSecurityGroup
+
+  EFSSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EFSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  EFSSecurityGroupIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EFSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref ProvisioningSecurityGroup
+
+  WebServerSecurityGroupEFSIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WebServerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref EFSSecurityGroup
+
+  # EFS File System
+  WordPressEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: WordPress-EFS
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref WordPressEFS
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # RDS Database
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for WordPress database
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: WordPress-DB-SubnetGroup
+
+  WordPressDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: wordpress-mariadb
+      DBName: wordpress
+      Engine: mariadb
+      EngineVersion: '10.11'
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      MultiAZ: !Ref EnableMultiAZ
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      Tags:
+        - Key: Name
+          Value: WordPress-MariaDB
+
+  # IAM Role for EC2 instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:DescribeFileSystems
+                  - elasticfilesystem:DescribeMountTargets
+                Resource: '*'
+        - PolicyName: SecretManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WordPressSecrets
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # Secrets Manager for WordPress keys
+  WordPressSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: wordpress-secrets
+      Description: WordPress authentication keys and salts
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: 'auth_key'
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'
+
+  # Launch Template
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: wordpress-launch-template
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: WordPress-ASG-Instance
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: WordPress-ASG-Volume
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Log all output
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            
+            # Update system
+            yum update -y
+            
+            # Install required packages
+            amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+            yum install -y httpd php php-mysqlnd php-gd php-xml php-mbstring php-json amazon-efs-utils aws-cfn-bootstrap
+            
+            # Install CloudWatch agent
+            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            rpm -U ./amazon-cloudwatch-agent.rpm
+            
+            # Configure CloudWatch agent
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWEOF'
+            {
+              "metrics": {
+                "namespace": "WordPress",
+                "metrics_collected": {
+                  "cpu": {
+                    "measurement": [
+                      {"name": "cpu_usage_idle", "rename": "CPU_IDLE", "unit": "Percent"},
+                      {"name": "cpu_usage_iowait", "rename": "CPU_IOWAIT", "unit": "Percent"}
+                    ],
+                    "totalcpu": false,
+                    "metrics_collection_interval": 60
+                  },
+                  "mem": {
+                    "measurement": [
+                      {"name": "mem_used_percent", "rename": "MEM_USED", "unit": "Percent"},
+                      {"name": "mem_available_percent", "rename": "MEM_AVAILABLE", "unit": "Percent"}
+                    ],
+                    "metrics_collection_interval": 60
+                  },
+                  "disk": {
+                    "measurement": [
+                      {"name": "used_percent", "rename": "DISK_USED", "unit": "Percent"}
+                    ],
+                    "resources": ["/", "/var/www/html/wp-content"],
+                    "metrics_collection_interval": 60
+                  },
+                  "netstat": {
+                    "measurement": [
+                      {"name": "tcp_established", "rename": "TCP_ESTABLISHED", "unit": "Count"},
+                      {"name": "tcp_time_wait", "rename": "TCP_TIME_WAIT", "unit": "Count"}
+                    ],
+                    "metrics_collection_interval": 60
+                  }
+                },
+                "aggregation_dimensions": [["InstanceId"], ["AutoScalingGroupName"]]
+              },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/httpd/error_log",
+                        "log_group_name": "/aws/ec2/wordpress/error",
+                        "log_stream_name": "{instance_id}"
+                      },
+                      {
+                        "file_path": "/var/log/httpd/access_log",
+                        "log_group_name": "/aws/ec2/wordpress/access",
+                        "log_stream_name": "{instance_id}"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+            CWEOF
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            
+            # Mount EFS
+            mkdir -p /var/www/html/wp-content
+            echo "${WordPressEFS}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html/wp-content nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev 0 0" >> /etc/fstab
+            mount -a
+            
+            # Set proper permissions for EFS mount
+            chown -R apache:apache /var/www/html/wp-content
+            chmod -R 755 /var/www/html/wp-content
+            
+            # Download and install WordPress
+            cd /tmp
+            wget https://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz
+            
+            # Copy WordPress files, excluding wp-content
+            rsync -avP --exclude 'wp-content' wordpress/ /var/www/html/
+            
+            # Create wp-config.php
+            cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+            
+            # Configure database settings
+            sed -i "s/database_name_here/wordpress/" /var/www/html/wp-config.php
+            sed -i "s/username_here/admin/" /var/www/html/wp-config.php
+            sed -i "s/password_here/${DBPassword}/" /var/www/html/wp-config.php
+            sed -i "s/localhost/${WordPressDatabase.Endpoint.Address}/" /var/www/html/wp-config.php
+            
+            # Add WordPress salts and keys
+            SALT_KEYS=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+            STRING='put your unique phrase here'
+            printf '%s\n' "g/$STRING/d" a "$SALT_KEYS" . w | ed -s /var/www/html/wp-config.php
+            
+            # Add extra WordPress configuration
+            cat >> /var/www/html/wp-config.php <<'WPEOF'
+            
+            /* WordPress performance optimizations */
+            define('WP_CACHE', true);
+            define('WP_MEMORY_LIMIT', '256M');
+            define('WP_MAX_MEMORY_LIMIT', '256M');
+            
+            /* WordPress security hardening */
+            define('DISALLOW_FILE_EDIT', true);
+            define('FORCE_SSL_ADMIN', false);
+            
+            /* WordPress behind load balancer configuration */
+            if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                $_SERVER['HTTPS'] = 'on';
+            }
+            if (isset($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+                $_SERVER['HTTP_HOST'] = $_SERVER['HTTP_X_FORWARDED_HOST'];
+            }
+            
+            /* WordPress file system method */
+            define('FS_METHOD', 'direct');
+            
+            WPEOF
+            
+            # Move the WordPress config line to the end
+            sed -i "/That's all, stop editing/d" /var/www/html/wp-config.php
+            sed -i "/require_once.*wp-settings.php/d" /var/www/html/wp-config.php
+            echo "/* That's all, stop editing! Happy publishing. */" >> /var/www/html/wp-config.php
+            echo "require_once ABSPATH . 'wp-settings.php';" >> /var/www/html/wp-config.php
+            
+            # Configure Apache
+            cat > /etc/httpd/conf.d/wordpress.conf <<'APACHEEOF'
+            <Directory /var/www/html>
+                Options Indexes FollowSymLinks
+                AllowOverride All
+                Require all granted
+            </Directory>
+            
+            # Enable compression
+            <IfModule mod_deflate.c>
+                AddOutputFilterByType DEFLATE text/plain
+                AddOutputFilterByType DEFLATE text/html
+                AddOutputFilterByType DEFLATE text/xml
+                AddOutputFilterByType DEFLATE text/css
+                AddOutputFilterByType DEFLATE application/xml
+                AddOutputFilterByType DEFLATE application/xhtml+xml
+                AddOutputFilterByType DEFLATE application/rss+xml
+                AddOutputFilterByType DEFLATE application/javascript
+                AddOutputFilterByType DEFLATE application/x-javascript
+            </IfModule>
+            
+            # Security headers
+            Header always set X-Content-Type-Options "nosniff"
+            Header always set X-Frame-Options "SAMEORIGIN"
+            Header always set X-XSS-Protection "1; mode=block"
+            
+            # Keep alive settings
+            KeepAlive On
+            MaxKeepAliveRequests 100
+            KeepAliveTimeout 5
+            APACHEEOF
+            
+            # Set proper permissions
+            chown -R apache:apache /var/www/html
+            chmod -R 755 /var/www/html
+            find /var/www/html -type d -exec chmod 755 {} \;
+            find /var/www/html -type f -exec chmod 644 {} \;
+            
+            # Configure SELinux if enabled
+            setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+            setsebool -p httpd_use_nfs on 2>/dev/null || true
+            
+            # Start and enable services
+            systemctl enable httpd
+            systemctl start httpd
+            
+            # Signal CloudFormation that the instance is ready
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WordPressAutoScalingGroup --region ${AWS::Region}
+
+  # Target Group
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: wordpress-target-group
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref WordPressVPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /wp-login.php
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200,302
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+        - Key: stickiness.enabled
+          Value: true
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: 86400
+
+  # Application Load Balancer
+  WordPressLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: wordpress-load-balancer
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: WordPress-ALB
+
+  # ALB Listener
+  WordPressListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Auto Scaling Group
+  WordPressAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      AutoScalingGroupName: wordpress-auto-scaling-group
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 6
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref WordPressTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupInServiceInstances
+            - GroupPendingInstances
+            - GroupTerminatingInstances
+            - GroupTotalInstances
+      Tags:
+        - Key: Name
+          Value: WordPress-ASG-Instance
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: Production
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: 2
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 2
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+
+  # Auto Scaling Policies
+  WordPressScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+
+  WordPressScaleOnRequestCountPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub '${WordPressLoadBalancer.LoadBalancerFullName}/${WordPressTargetGroup.TargetGroupFullName}'
+        TargetValue: 1000.0
+
+  # WordPress Provis
